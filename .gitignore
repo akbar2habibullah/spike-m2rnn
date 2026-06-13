@@ -1,1 +1,12 @@
 paper/
+__pycache__/
+*.pyc
+data/**/*.bin
+data/**/input.txt
+input.txt
+*.log
+out*/
+checkpoints/
+*.pt
+wandb/
+.ipynb_checkpoints/

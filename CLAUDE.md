@@ -22,19 +22,23 @@ all at once. The goal is **state-tracking expressivity on a multiply-free substr
 ├── reference/
 │   └── eggroll_vit_mnist.py  # working EGGROLL ViT; canonical ES machinery to mirror
 ├── src/spiking_m2rnn/
-│   ├── eggroll.py            # eggroll_linear, eggroll_ln, sample_noise, fitness, update
-│   ├── model.py              # SpikingM2RNN (modes: "spike" | "tanh")
-│   ├── data.py               # char data + get_batch
-│   └── train.py              # train / eval / generate
+│   ├── config.py            # constants + Config dataclass (per-task overrides)
+│   ├── eggroll.py           # eggroll_linear, eggroll_ln, sample_noise, fitness, es_update
+│   ├── model.py             # SpikingM2RNN (modes: "spike" | "tanh")
+│   ├── data.py              # char data + get_batch
+│   ├── train.py             # train / eval / generate
+│   └── Stage_0.py           # FROZEN single-file reference (do not edit; equivalence target)
 ├── tasks/
 │   ├── shakespeare/          # char-LM smoke test (Stage 0)
-│   └── state_tracking/       # S3/S5 length-gen — the REAL validation (TODO)
+│   └── state_tracking/       # S3/S5 length-gen — the REAL validation (s_n.py done; trainer TODO)
 ├── kernels/                  # Triton (Stage 2, TODO)
-├── tests/                    # cross-stage numerical equivalence (TODO)
+├── tests/                    # cross-stage numerical equivalence (test_equivalence.py)
 └── logs/
 ```
-The current code is a single file (`spiking_m2rnn_es.py` / `Stage_0.py`). An early,
-safe task is to split it into `src/spiking_m2rnn/` as above — behaviour-preserving.
+The split out of the single-file `Stage_0.py` into `src/spiking_m2rnn/` is **done**
+and behaviour-preserving: `tests/test_equivalence.py` asserts the modular path is
+bit-identical to the frozen `Stage_0.py` (forward both modes + a full ES step, 0.0
+error in float64). Keep `Stage_0.py` frozen as the reference per guardrail #2.
 
 `.gitignore` should cover: `__pycache__/`, `*.pyc`, `data/**/*.bin`,
 `data/**/input.txt`, `*.log`, `out*/`, `checkpoints/`, `*.pt`, `wandb/`,
