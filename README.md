@@ -48,20 +48,21 @@ cd src
 python -m spiking_m2rnn.train --mode tanh --data ../path/to/input.txt
 ```
 
-### (b) S3/S5 state-tracking with length generalization — 🚧 generator done, trainer TODO
+### (b) S3/S5 state-tracking with length generalization — ✅ runnable
 **Tests:** the architecture's actual reason for being. Predict the running product of
 a permutation stream; **train at short T, eval at longer T**. S5 is non-solvable ⇒
 NC1-complete (a Transformer/diagonal-SSM cannot track it; a finite-precision
 non-linear RNN can).
 
-The data generator exists and is self-checked:
 ```bash
-python tasks/state_tracking/s_n.py        # S3 (vocab 6) + S5 (vocab 120) self-check
+python tasks/state_tracking/s_n.py                          # generator self-check
+python tasks/state_tracking/train_sn.py --n 5 --mode tanh   # run the CONTROL first
+python tasks/state_tracking/train_sn.py --n 5 --mode spike --decay 1.0
 ```
-The trainer (length-sweep **accuracy** eval, not bpc) is not built yet — see
-[tasks/state_tracking/README.md](tasks/state_tracking/README.md). When standing it
-up: run the `tanh` control first, and replace `DECAY=0.9` with the input-dependent
-shift-decay (DESIGN §6.4) — a 7-step half-life erases early state.
+Eval prints per-position accuracy at each `--eval-lens` (default `16 32 64 128 256`,
+trained at `--train-len 32`); flat-with-length = generalizing. Defaults bake in the
+method notes (tanh first; `decay=1.0` non-leaky IF, since 0.9 erases state — DESIGN
+§6.4). Full knob list: [tasks/state_tracking/README.md](tasks/state_tracking/README.md).
 
 ---
 
