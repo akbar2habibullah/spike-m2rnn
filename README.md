@@ -71,10 +71,19 @@ difficulty-ladder tips: [tasks/state_tracking/README.md](tasks/state_tracking/RE
 
 ---
 
-## Stage 1a — MAC-free conversion — 🚧 TODO
-Integer membrane, shift-based leak `U − (U≫n)`, subtractive reset, input-dependent
-shift-decay. **Must numerically validate against Stage 0** before proceeding. Isolates
-the multiply-free claim. (No launch command yet.)
+## Stage 1a — MAC-free recurrence dynamics — 🛠️ IN PROGRESS
+Multiply-free membrane: input-dependent **shift-decay** `2^{-s_t}` (`s_t∈{0,1,2,3}`,
+leak = bit-shift) + **subtractive reset**. `W` stays float here (so `trans` keeps the
+accumulator float); integer membrane lands once `W` is ternary (1b). Opt-in, validated
+to learn S3 length-gen; Stage-0 `spike` path stays bit-identical (equivalence test).
+```bash
+# float prototype of the decay gate (the spike analog of tanh's forget gate):
+python tasks/state_tracking/train_sn.py --n 3 --mode spike --input-decay <model/ES flags>
+# MAC-free dynamics (shift-decay + subtractive reset):
+python tasks/state_tracking/train_sn.py --n 3 --mode spike --mac-free   <model/ES flags>
+```
+`--input-decay` (continuous gate) already gives **perfect, stable S3 length-gen** —
+on par with tanh. `--mac-free` is the multiply-free version of the same.
 
 ## Stage 1b — ternary `W` (BitNet) — 🚧 TODO
 Float latent master + quantize-in-forward + **per-member 2-bit materialization**

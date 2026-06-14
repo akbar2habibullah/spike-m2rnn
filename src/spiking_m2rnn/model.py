@@ -39,7 +39,8 @@ from .eggroll import eggroll_linear, eggroll_ln, sample_noise, zero_noise
 class SpikingM2RNN(nn.Module):
     def __init__(self, vocab, dim=config.DIM, depth=config.DEPTH, k=config.K_DIM,
                  v=config.V_DIM, mlp=config.MLP_DIM, mode=config.MODE,
-                 threshold=config.THRESHOLD, decay=config.DECAY, input_decay=False):
+                 threshold=config.THRESHOLD, decay=config.DECAY, input_decay=False,
+                 mac_free=False):
         super().__init__()
         self.dim, self.depth, self.k, self.v, self.mode, self.vocab = dim, depth, k, v, mode, vocab
         self.threshold, self.decay = threshold, decay
@@ -47,7 +48,14 @@ class SpikingM2RNN(nn.Module):
         # input-dependent, state-INDEPENDENT decay gate -- the float prototype of DESIGN
         # 6.4's shift-decay, and the spike analog of tanh's forget gate f_t. Opt-in so the
         # Stage-0 "spike" path stays bit-identical to the frozen reference (guardrail #2).
-        self.input_decay = input_decay and mode == "spike"
+        # mac_free (Stage 1a, spike only): make the membrane dynamics MULTIPLY-FREE --
+        # the decay gate is quantized to a power of two 2^{-s_t}, s_t in {0,1,2,3} (the
+        # leak is a bit-shift, not a float multiply), and the reset is subtractive
+        # (U -= theta*S) rather than a masked zero. Implies the decay gate. W stays float
+        # here (so the accumulator is still float via `trans`); ternary W + integer
+        # membrane is Stage 1b.
+        self.mac_free = mac_free and mode == "spike"
+        self.input_decay = (input_decay or self.mac_free) and mode == "spike"
 
         Pd = nn.ParameterDict()
         def mat(name, o, i):
@@ -120,8 +128,15 @@ class SpikingM2RNN(nn.Module):
                 Kp = (Kp > 0).to(x.dtype)
                 Vp = (Vp > 0).to(x.dtype)
                 f_t = None
-                if self.input_decay:                          # learnable input-dependent leak in (0,1)
-                    d_t = torch.sigmoid(self._lin(xn, p + "_d", noise, sigma))   # (P,B,T,1)
+                if self.input_decay:                          # learnable input-dependent leak
+                    raw = self._lin(xn, p + "_d", noise, sigma)                  # (P,B,T,1)
+                    if self.mac_free:
+                        # quantize to a shift amount s_t in {0,1,2,3} -> decay = 2^{-s_t}
+                        # (s_t=0 hold, s_t=3 fast forget); the leak is a bit-shift in-kernel.
+                        s_t = torch.round(torch.sigmoid(raw) * 3.0).clamp_(0.0, 3.0)
+                        d_t = torch.pow(2.0, -s_t)
+                    else:
+                        d_t = torch.sigmoid(raw)                                 # continuous in (0,1)
             else:                                             # analog M2RNN
                 f_t = torch.sigmoid(self._lin(xn, p + "_f", noise, sigma))   # (P,B,T,1)
 
@@ -136,7 +151,10 @@ class SpikingM2RNN(nn.Module):
                     decay = d_t[:, :, t, :].unsqueeze(-1) if self.input_decay else self.decay  # (P,B,1,1) | scalar
                     mem = decay * mem + trans + outer
                     S   = (mem > self.threshold).to(x.dtype)
-                    mem = mem * (1.0 - S)                                          # hard reset
+                    if self.mac_free:
+                        mem = mem - self.threshold * S                            # subtractive reset
+                    else:
+                        mem = mem * (1.0 - S)                                      # hard reset
                     yt  = torch.einsum("pbkv,pbk->pbv", S, qt)
                     state = S
                     if return_fire:

@@ -120,11 +120,12 @@ def _fmt_profile(acc_per_pos, train_max):
 
 
 def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
-          generators="all", input_decay=False):
+          generators="all", input_decay=False, mac_free=False):
     vocab = group.size
     model = SpikingM2RNN(vocab, dim=cfg.dim, depth=cfg.depth, k=cfg.k_dim, v=cfg.v_dim,
                          mlp=cfg.mlp_dim, mode=cfg.mode, threshold=cfg.threshold,
-                         decay=cfg.decay, input_decay=input_decay).to(cfg.device).to(cfg.dtype)
+                         decay=cfg.decay, input_decay=input_decay,
+                         mac_free=mac_free).to(cfg.device).to(cfg.dtype)
     model.eval(); model.requires_grad_(False)
     if compile:
         # PERF note: this task feeds many sequence lengths (train_lens + eval_lens +
@@ -142,7 +143,8 @@ def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
     profile_len = max(eval_lens)
     nparams = sum(p.numel() for p in model.P.values())
     ngen = group.size if generators == "all" else len(generators)
-    decay_desc = "input-dependent" if input_decay else cfg.decay
+    decay_desc = ("shift-decay 2^-s + subtractive reset (MAC-free)" if mac_free
+                  else "input-dependent" if input_decay else cfg.decay)
     print(f"task=S{group.n} vocab={vocab} mode={cfg.mode} params={nparams:,} "
           f"pop={cfg.pop_size} sigma={cfg.sigma} decay={decay_desc} "
           f"train_lens={train_lens} eval_lens={eval_lens} gens={ngen} device={cfg.device}")
@@ -201,6 +203,10 @@ def _cli():
                     help="spike only: learnable input-dependent decay gate (DESIGN §6.4 float "
                          "prototype; the spike analog of tanh's forget gate). Recommended for "
                          "long-range tracking — a constant leak can't both hold and forget.")
+    ap.add_argument("--mac-free", action="store_true",
+                    help="spike only (Stage 1a): MULTIPLY-FREE membrane — shift-decay 2^{-s_t} "
+                         "(s_t in {0,1,2,3}, leak = bit-shift) + subtractive reset. Implies the "
+                         "decay gate. W stays float here (ternary W is Stage 1b).")
     ap.add_argument("--threshold", type=float, default=config.THRESHOLD)
     ap.add_argument("--batch", type=int, default=config.BATCH_SIZE)
     ap.add_argument("--chunk", type=int, default=config.CHUNK)
@@ -223,7 +229,8 @@ def _cli():
     group = SymmetricGroup(args.n)
     generators = "all" if args.generators == "all" else group.default_generators()
     train(group, args.train_lens, args.eval_lens, args.steps, args.eval_every,
-          cfg, compile=args.compile, generators=generators, input_decay=args.input_decay)
+          cfg, compile=args.compile, generators=generators,
+          input_decay=args.input_decay, mac_free=args.mac_free)
 
 
 if __name__ == "__main__":
