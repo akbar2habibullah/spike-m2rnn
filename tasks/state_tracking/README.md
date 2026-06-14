@@ -25,6 +25,15 @@ Key knobs: `--generators {min,all}` (input alphabet — see below), `--train-len
 `--pop --sigma --decay --threshold`, model size `--dim --depth --k --v --mlp`,
 `--chunk` (OOM relief). S3 (`--n 3`, solvable warm-up) vs S5 (`--n 5`, NC1-complete).
 
+**`--input-decay` (spike only) — recommended for long-range tracking.** Replaces the
+constant membrane leak with a learnable, input-dependent, state-independent decay gate
+— the float prototype of DESIGN §6.4's shift-decay and the spike analog of tanh's forget
+gate `f_t`. A constant `decay` can't both *hold* state (needs ≈1) and *forget* it
+(needs <1); a fixed 1.0 also integrates unboundedly over long sequences. This gate is
+the principled fix for spike's instability/length-gen gap, and the first step of Stage
+1a (later integerized to `2^{-s_t}`). The Stage-0 `spike` path is unchanged when the
+flag is off.
+
 **`--generators` is the difficulty dial.** `min` (default) draws inputs from a fixed
 **2-element generating set** — the model only has to learn 2 transition functions, yet
 the reachable state still spans the whole group. This is the standard word problem and

@@ -119,11 +119,12 @@ def _fmt_profile(acc_per_pos, train_max):
     return " ".join(segs)
 
 
-def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False, generators="all"):
+def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
+          generators="all", input_decay=False):
     vocab = group.size
     model = SpikingM2RNN(vocab, dim=cfg.dim, depth=cfg.depth, k=cfg.k_dim, v=cfg.v_dim,
                          mlp=cfg.mlp_dim, mode=cfg.mode, threshold=cfg.threshold,
-                         decay=cfg.decay).to(cfg.device).to(cfg.dtype)
+                         decay=cfg.decay, input_decay=input_decay).to(cfg.device).to(cfg.dtype)
     model.eval(); model.requires_grad_(False)
     if compile:
         # PERF note: this task feeds many sequence lengths (train_lens + eval_lens +
@@ -141,8 +142,9 @@ def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False, g
     profile_len = max(eval_lens)
     nparams = sum(p.numel() for p in model.P.values())
     ngen = group.size if generators == "all" else len(generators)
+    decay_desc = "input-dependent" if input_decay else cfg.decay
     print(f"task=S{group.n} vocab={vocab} mode={cfg.mode} params={nparams:,} "
-          f"pop={cfg.pop_size} sigma={cfg.sigma} decay={cfg.decay} "
+          f"pop={cfg.pop_size} sigma={cfg.sigma} decay={decay_desc} "
           f"train_lens={train_lens} eval_lens={eval_lens} gens={ngen} device={cfg.device}")
     chance = 1.0 / vocab
     print(f"(chance accuracy = {chance*100:.2f}%; profile '|' marks the train/extrapolation "
@@ -194,7 +196,11 @@ def _cli():
     ap.add_argument("--pop", type=int, default=config.POP_SIZE)
     ap.add_argument("--sigma", type=float, default=config.SIGMA)
     ap.add_argument("--decay", type=float, default=1.0,
-                    help="spike membrane leak; 1.0 = non-leaky IF (default for tracking)")
+                    help="spike membrane leak; 1.0 = non-leaky IF (ignored if --input-decay)")
+    ap.add_argument("--input-decay", action="store_true",
+                    help="spike only: learnable input-dependent decay gate (DESIGN §6.4 float "
+                         "prototype; the spike analog of tanh's forget gate). Recommended for "
+                         "long-range tracking — a constant leak can't both hold and forget.")
     ap.add_argument("--threshold", type=float, default=config.THRESHOLD)
     ap.add_argument("--batch", type=int, default=config.BATCH_SIZE)
     ap.add_argument("--chunk", type=int, default=config.CHUNK)
@@ -217,7 +223,7 @@ def _cli():
     group = SymmetricGroup(args.n)
     generators = "all" if args.generators == "all" else group.default_generators()
     train(group, args.train_lens, args.eval_lens, args.steps, args.eval_every,
-          cfg, compile=args.compile, generators=generators)
+          cfg, compile=args.compile, generators=generators, input_decay=args.input_decay)
 
 
 if __name__ == "__main__":

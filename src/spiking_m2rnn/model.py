@@ -39,10 +39,15 @@ from .eggroll import eggroll_linear, eggroll_ln, sample_noise, zero_noise
 class SpikingM2RNN(nn.Module):
     def __init__(self, vocab, dim=config.DIM, depth=config.DEPTH, k=config.K_DIM,
                  v=config.V_DIM, mlp=config.MLP_DIM, mode=config.MODE,
-                 threshold=config.THRESHOLD, decay=config.DECAY):
+                 threshold=config.THRESHOLD, decay=config.DECAY, input_decay=False):
         super().__init__()
         self.dim, self.depth, self.k, self.v, self.mode, self.vocab = dim, depth, k, v, mode, vocab
         self.threshold, self.decay = threshold, decay
+        # input_decay (spike only): replace the constant membrane leak with a learnable,
+        # input-dependent, state-INDEPENDENT decay gate -- the float prototype of DESIGN
+        # 6.4's shift-decay, and the spike analog of tanh's forget gate f_t. Opt-in so the
+        # Stage-0 "spike" path stays bit-identical to the frozen reference (guardrail #2).
+        self.input_decay = input_decay and mode == "spike"
 
         Pd = nn.ParameterDict()
         def mat(name, o, i):
@@ -61,6 +66,8 @@ class SpikingM2RNN(nn.Module):
             mat(p + "_v", v, dim)
             if mode == "tanh":
                 mat(p + "_f", 1, dim)                  # forget-gate logits (analog M2RNN only)
+            if self.input_decay:
+                mat(p + "_d", 1, dim)                  # input-dependent decay-gate logits (spike)
             mat(p + "_W", v, v)                        # state transition (V x V) -- the BitNet-able matrix
             mat(p + "_o", dim, v)                      # readout projection V -> dim
             lnp(p + "_ln2", dim)
@@ -107,11 +114,14 @@ class SpikingM2RNN(nn.Module):
             Q  = self._lin(xn, p + "_q", noise, sigma)        # (P,B,T,k)
             Kp = self._lin(xn, p + "_k", noise, sigma)        # (P,B,T,k)
             Vp = self._lin(xn, p + "_v", noise, sigma)        # (P,B,T,v)
+            d_t = None
             if self.mode == "spike":
                 Q  = (Q  > 0).to(x.dtype)                     # spike-encode q/k/v (threshold 0; bias = -threshold)
                 Kp = (Kp > 0).to(x.dtype)
                 Vp = (Vp > 0).to(x.dtype)
                 f_t = None
+                if self.input_decay:                          # learnable input-dependent leak in (0,1)
+                    d_t = torch.sigmoid(self._lin(xn, p + "_d", noise, sigma))   # (P,B,T,1)
             else:                                             # analog M2RNN
                 f_t = torch.sigmoid(self._lin(xn, p + "_f", noise, sigma))   # (P,B,T,1)
 
@@ -123,7 +133,8 @@ class SpikingM2RNN(nn.Module):
                 outer = torch.einsum("pbk,pbv->pbkv", kt, vt)                      # k_t (x) v_t
                 trans = self._lin(state, p + "_W", noise, sigma)                   # transition on PREVIOUS state
                 if self.mode == "spike":
-                    mem = self.decay * mem + trans + outer
+                    decay = d_t[:, :, t, :].unsqueeze(-1) if self.input_decay else self.decay  # (P,B,1,1) | scalar
+                    mem = decay * mem + trans + outer
                     S   = (mem > self.threshold).to(x.dtype)
                     mem = mem * (1.0 - S)                                          # hard reset
                     yt  = torch.einsum("pbkv,pbk->pbv", S, qt)
