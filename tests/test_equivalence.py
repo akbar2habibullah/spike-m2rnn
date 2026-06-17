@@ -156,9 +156,27 @@ def test_ternary_path_materialized_reference():
     print(f"ternary materialized-reference max abs err: {err:.2e}")
 
 
+def test_newton_schulz_orthogonalizes():
+    """Muon Newton-Schulz EQUALIZES the singular values toward ~1 (it's an approximate
+    polar factor, not an exact orthogonalization). Assert the output's singular values
+    are pulled into the NS5 band, regardless of how spread the input's were."""
+    from spiking_m2rnn.eggroll import newton_schulz
+
+    torch.manual_seed(3)
+    for shape in [(16, 6), (6, 16), (10, 10)]:
+        G = torch.randn(*shape, dtype=torch.float64)
+        # skew the conditioning so equalization is a real test
+        G[0] *= 20.0
+        sv = torch.linalg.svdvals(newton_schulz(G, steps=6).double())
+        assert sv.min() > 0.6 and sv.max() < 1.4, \
+            f"shape {shape}: singular values not equalized: [{sv.min():.3f}, {sv.max():.3f}]"
+        print(f"newton_schulz {shape}: singular values in [{sv.min():.3f}, {sv.max():.3f}]")
+
+
 if __name__ == "__main__":
     test_forward_spike()
     test_forward_tanh()
     test_es_update_matches()
     test_ternary_path_materialized_reference()
+    test_newton_schulz_orthogonalizes()
     print("OK: modular path is numerically identical to Stage_0 reference.")

@@ -14,6 +14,7 @@ from .eggroll import (
     eggroll_ln,
     es_update,
     fitness_from_loss,
+    newton_schulz,
     per_member_loss,
     sample_noise,
     zero_noise,
@@ -32,4 +33,5 @@ __all__ = [
     "per_member_loss",
     "fitness_from_loss",
     "es_update",
+    "newton_schulz",
 ]

@@ -70,6 +70,10 @@ class Config:
     sigma: float = SIGMA
     lr: float = LR
     chunk: "int | None" = CHUNK
+    # Muon-style orthogonalized update (opt-in): decouples step size from gradient-estimate
+    # magnitude so POP only sharpens direction (DESIGN 6.2 dead-zone). muon_lr is the step.
+    muon: bool = False
+    muon_lr: float = 0.02
 
     @property
     def rank_scale(self) -> float:

@@ -25,6 +25,15 @@ Key knobs: `--generators {min,all}` (input alphabet — see below), `--train-len
 `--pop --sigma --decay --threshold`, model size `--dim --depth --k --v --mlp`,
 `--chunk` (OOM relief). S3 (`--n 3`, solvable warm-up) vs S5 (`--n 5`, NC1-complete).
 
+**`--muon` — orthogonalized update; makes POP a direction knob, not a step-size knob.**
+The ES step normally scales as `LR/(POP·SIGMA)·Σ f_p A_p B_pᵀ`; on the piecewise-constant
+spiking/ternary landscape (§6.2) a larger POP estimates the (near-zero) gradient of a flat
+region more faithfully → smaller steps → *slower* convergence. `--muon` Newton-Schulz-
+orthogonalizes the matrix update (and RMS-normalizes the vector update), so the step is a
+fixed size (`--muon-lr`, default 0.02) in the estimated direction regardless of its
+magnitude. POP then only sharpens direction; raise it freely. SIGMA still controls
+exploration. One clean step-size knob instead of the POP/SIGMA/LR tangle.
+
 **`--input-decay` (spike only) — recommended for long-range tracking.** Replaces the
 constant membrane leak with a learnable, input-dependent, state-independent decay gate
 — the float prototype of DESIGN §6.4's shift-decay and the spike analog of tanh's forget

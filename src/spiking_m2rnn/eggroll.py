@@ -138,15 +138,50 @@ def fitness_from_loss(loss):
 
 
 # ===================== parameter update =====================
+def newton_schulz(G, steps=5, eps=1e-7):
+    """Muon's Newton-Schulz quintic iteration: returns the approximate orthogonal /
+    polar factor of a 2D matrix G (i.e. U V^T for G = U S V^T), equalizing the singular
+    values to ~1 while preserving the update's orientation. Computed in float32."""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.float()
+    X = X / (X.norm() + eps)                          # bound the spectral norm <= 1
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:                                    # iterate on the smaller dimension
+        X = X.t()
+    for _ in range(steps):
+        Z = X @ X.t()
+        X = a * X + (b * Z + c * (Z @ Z)) @ X
+    return X.t() if transposed else X
+
+
 @torch.no_grad()
-def es_update(params, noise, fit, coeff, rank_scale=config.RANK_SCALE):
-    """In-place ES step: par += coeff * upd, where for `_w` matrices
-    upd = (1/sqrt r) sum_p f_p A_p B_p^T (no perturbed weight materialized),
-    and for dense params upd = sum_p f_p * noise_p (tensordot over the pop axis)."""
+def es_update(params, noise, fit, coeff, rank_scale=config.RANK_SCALE,
+              muon=False, muon_lr=0.02, ns_steps=5, eps=1e-7):
+    """In-place ES step.
+
+    Default (muon=False): par += coeff * upd, where for `_w` matrices
+    upd = (1/sqrt r) sum_p f_p A_p B_p^T (no perturbed weight materialized), and for
+    dense params upd = sum_p f_p * noise_p (tensordot over the pop axis).
+
+    muon=True: orthogonalize the matrix update (Newton-Schulz) and RMS-normalize the
+    vector update, then step by `muon_lr`. This DECOUPLES the step magnitude from the
+    gradient-estimate magnitude -- so POP only sharpens the direction, it no longer
+    shrinks the step (the fix for "larger POP -> slower convergence" on the spiking /
+    ternary dead-zone landscape, DESIGN 6.2). `coeff` is unused in this mode."""
     for name, par in params.items():
         if name.endswith("_w"):
             A, B = noise[name]
             upd = rank_scale * torch.einsum("p,por,pir->oi", fit, A, B)
         else:
             upd = torch.tensordot(fit, noise[name], dims=([0], [0]))
-        par.data.add_(coeff * upd.to(par.dtype))
+
+        if muon:
+            if upd.dim() == 2:                        # matrix: orthogonalize (unit sing. values)
+                X = newton_schulz(upd, ns_steps, eps)
+                step = muon_lr * (max(upd.shape) ** 0.5) * X      # per-element RMS ~ muon_lr
+            else:                                     # vector: RMS-normalize to ~1 per element
+                g = upd.float()
+                step = muon_lr * g / (g.norm() + eps) * (g.numel() ** 0.5)
+            par.data.add_(step.to(par.dtype))
+        else:
+            par.data.add_(coeff * upd.to(par.dtype))

@@ -147,10 +147,11 @@ def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
     decay_desc = ("shift-decay 2^-s + subtractive reset (MAC-free)" if mac_free
                   else "input-dependent" if input_decay else cfg.decay)
     ternary_desc = "all" if ternary_all else ("W" if ternary_W else "off")
+    upd_desc = f"muon(lr={cfg.muon_lr})" if cfg.muon else f"es(lr={cfg.lr})"
     print(f"task=S{group.n} vocab={vocab} mode={cfg.mode} params={nparams:,} "
           f"pop={cfg.pop_size} sigma={cfg.sigma} decay={decay_desc} "
-          f"ternary={ternary_desc} train_lens={train_lens} eval_lens={eval_lens} "
-          f"gens={ngen} device={cfg.device}")
+          f"ternary={ternary_desc} update={upd_desc} train_lens={train_lens} "
+          f"eval_lens={eval_lens} gens={ngen} device={cfg.device}")
     chance = 1.0 / vocab
     print(f"(chance accuracy = {chance*100:.2f}%; profile '|' marks the train/extrapolation "
           f"boundary at pos {train_max}; compile={'on' if compile else 'OFF (perf)'})")
@@ -173,7 +174,8 @@ def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
                     parts.append(per_member_loss(model(x, sub, cfg.sigma), y))
                 loss = torch.cat(parts)
         fit = fitness_from_loss(loss).to(cfg.dtype)
-        es_update(model.P, noise, fit, coeff, cfg.rank_scale)
+        es_update(model.P, noise, fit, coeff, cfg.rank_scale,
+                  muon=cfg.muon, muon_lr=cfg.muon_lr)
 
         if step == 1 or step % eval_every == 0:
             acc = eval_length_sweep(model, group, eval_lens, cfg, generators)
@@ -200,6 +202,12 @@ def _cli():
                          "Cayley table — far harder, was pinning ES at chance).")
     ap.add_argument("--pop", type=int, default=config.POP_SIZE)
     ap.add_argument("--sigma", type=float, default=config.SIGMA)
+    ap.add_argument("--muon", action="store_true",
+                    help="Muon-style orthogonalized ES update: decouples step size from "
+                         "gradient magnitude so POP only sharpens direction (fixes "
+                         "'larger POP -> slower convergence' on the dead-zone landscape).")
+    ap.add_argument("--muon-lr", type=float, default=0.02,
+                    help="step size for --muon (per-element RMS step; POP-independent).")
     ap.add_argument("--decay", type=float, default=1.0,
                     help="spike membrane leak; 1.0 = non-leaky IF (ignored if --input-decay)")
     ap.add_argument("--input-decay", action="store_true",
@@ -236,6 +244,7 @@ def _cli():
         config.DEFAULT, mode=args.mode, pop_size=args.pop, sigma=args.sigma,
         decay=args.decay, threshold=args.threshold, batch_size=args.batch, chunk=args.chunk,
         dim=args.dim, depth=args.depth, k_dim=args.k, v_dim=args.v, mlp_dim=args.mlp,
+        muon=args.muon, muon_lr=args.muon_lr,
     )
     group = SymmetricGroup(args.n)
     generators = "all" if args.generators == "all" else group.default_generators()
