@@ -121,12 +121,16 @@ def _fmt_profile(acc_per_pos, train_max):
 
 def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
           generators="all", input_decay=False, mac_free=False, ternary_W=False,
-          ternary_all=False):
+          ternary_all=False, int_membrane=False, theta=None, use_kernel=False,
+          outer_gain=None, ternary_lowrank=False):
     vocab = group.size
     model = SpikingM2RNN(vocab, dim=cfg.dim, depth=cfg.depth, k=cfg.k_dim, v=cfg.v_dim,
                          mlp=cfg.mlp_dim, mode=cfg.mode, threshold=cfg.threshold,
                          decay=cfg.decay, input_decay=input_decay, mac_free=mac_free,
-                         ternary_W=ternary_W, ternary_all=ternary_all).to(cfg.device).to(cfg.dtype)
+                         ternary_W=ternary_W, ternary_all=ternary_all,
+                         int_membrane=int_membrane, theta=theta, outer_gain=outer_gain,
+                         use_kernel=use_kernel, ternary_lowrank=ternary_lowrank).to(cfg.device).to(cfg.dtype)
+    tern_lr_keys = model.ternary_lr_keys()
     model.eval(); model.requires_grad_(False)
     if compile:
         # PERF note: this task feeds many sequence lengths (train_lens + eval_lens +
@@ -146,10 +150,14 @@ def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
     ngen = group.size if generators == "all" else len(generators)
     decay_desc = ("shift-decay 2^-s + subtractive reset (MAC-free)" if mac_free
                   else "input-dependent" if input_decay else cfg.decay)
-    ternary_desc = "all" if ternary_all else ("W" if ternary_W else "off")
+    ternary_desc = "all" if model.ternary_all else ("W" if model.ternary_W else "off")
     upd_desc = f"muon(lr={cfg.muon_lr})" if cfg.muon else f"es(lr={cfg.lr})"
+    membrane_desc = (f"int(theta={model.theta},outer_gain={model.outer_gain})"
+                     if model.int_membrane else "float")
+    if model.ternary_lowrank:
+        ternary_desc += f"+lowrank({len(tern_lr_keys)} mats, no-materialize)"
     print(f"task=S{group.n} vocab={vocab} mode={cfg.mode} params={nparams:,} "
-          f"pop={cfg.pop_size} sigma={cfg.sigma} decay={decay_desc} "
+          f"pop={cfg.pop_size} sigma={cfg.sigma} decay={decay_desc} membrane={membrane_desc} "
           f"ternary={ternary_desc} update={upd_desc} train_lens={train_lens} "
           f"eval_lens={eval_lens} gens={ngen} device={cfg.device}")
     chance = 1.0 / vocab
@@ -175,7 +183,7 @@ def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
                 loss = torch.cat(parts)
         fit = fitness_from_loss(loss).to(cfg.dtype)
         es_update(model.P, noise, fit, coeff, cfg.rank_scale,
-                  muon=cfg.muon, muon_lr=cfg.muon_lr)
+                  muon=cfg.muon, muon_lr=cfg.muon_lr, ternarize_keys=tern_lr_keys)
 
         if step == 1 or step % eval_every == 0:
             acc = eval_length_sweep(model, group, eval_lens, cfg, generators)
@@ -226,6 +234,28 @@ def _cli():
                     help="Stage 1b: ternarize EVERY weight matmul (embed/q/k/v/o/fc/W/head) — a "
                          "fully multiply-free model. Implies --ternary-w. Slower (no shared base "
                          "GEMM; per-member materialization everywhere); use --chunk. Tune σ/pop.")
+    ap.add_argument("--int-membrane", action="store_true",
+                    help="Stage 2.0: INTEGER recurrence (int32 membrane, arithmetic shift leak, "
+                         "ternary×binary trans, integer θ, subtractive reset) — the Triton kernel's "
+                         "bit-exact contract (kernels/DESIGN.md §2). Implies --mac-free --ternary-all. "
+                         "Sweep --theta and re-validate S3 (the fp→int switch shifts dynamics).")
+    ap.add_argument("--theta", type=int, default=None,
+                    help="integer firing threshold for --int-membrane (default 10). The fp "
+                         "threshold 1.0 maps to ≈1/scale≈10 integer units (DESIGN §2.1/§7).")
+    ap.add_argument("--outer-gain", type=int, default=None,
+                    help="integer weight on the k⊗v write for --int-membrane (default = θ). "
+                         "The naive scale-fold (outer∈{0,1}) leaves the write ~10x too weak vs "
+                         "trans; outer_gain≈round(1/scale)≈10 restores the fp balance (DESIGN §7).")
+    ap.add_argument("--use-kernel", action="store_true",
+                    help="run the int_membrane recurrence through the Triton kernel (Stage 2.1, "
+                         "bit-exact vs the torch reference; ~84x faster recurrence). Requires "
+                         "--int-membrane and a CUDA GPU.")
+    ap.add_argument("--ternary-lowrank", action="store_true",
+                    help="train ternary PROJECTIONS (everything but the transition W) with the "
+                         "LINEAR no-materialize path (ternary base + ternary low-rank): recovers "
+                         "EGGROLL's never-materialize trick (memory O((O+I)·r)/member, not O(O·I)) "
+                         "and stays multiply-free. ES perturbation becomes ternary, not Gaussian "
+                         "(DESIGN §6.6) -- a search-distribution change to re-validate.")
     ap.add_argument("--threshold", type=float, default=config.THRESHOLD)
     ap.add_argument("--batch", type=int, default=config.BATCH_SIZE)
     ap.add_argument("--chunk", type=int, default=config.CHUNK)
@@ -251,7 +281,10 @@ def _cli():
     train(group, args.train_lens, args.eval_lens, args.steps, args.eval_every,
           cfg, compile=args.compile, generators=generators,
           input_decay=args.input_decay, mac_free=args.mac_free,
-          ternary_W=args.ternary_w, ternary_all=args.ternary_all)
+          ternary_W=args.ternary_w, ternary_all=args.ternary_all,
+          int_membrane=args.int_membrane, theta=args.theta,
+          outer_gain=args.outer_gain, use_kernel=args.use_kernel,
+          ternary_lowrank=args.ternary_lowrank)
 
 
 if __name__ == "__main__":

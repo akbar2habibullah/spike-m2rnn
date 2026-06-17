@@ -57,6 +57,55 @@ def ternary_quantize(W, eps=1e-5):
     return Wq * scale
 
 
+def ternarize_factor(t):
+    """Deterministic ternary {-1,0,+1} of a low-rank noise factor, used by the
+    no-materialize ternary path (`eggroll_linear_ternary_lowrank`). round(clamp(·)) ->
+    ~38% zeros, rest ±1 for N(0,1) input. Applied IDENTICALLY in the forward and in
+    `es_update`, so the perturbation that is applied is exactly the one accumulated
+    (the ES invariant). The resulting ES perturbation is ternary/Rademacher rather than
+    Gaussian -- a different (SPSA-like) search distribution; re-validate (DESIGN §6.6,
+    invariant #2)."""
+    return torch.round(t.clamp(-1.0, 1.0))
+
+
+def eggroll_linear_ternary_lowrank(x, weight, A, B, bias=None, bias_noise=None,
+                                   sigma=config.SIGMA, rank_scale=config.RANK_SCALE):
+    """Multiply-free EGGROLL linear that STAYS LINEAR -> no per-member materialization.
+
+    The §6.6 tension is only there because `quantize(W + sigma A Bᵀ)` is nonlinear. If we
+    instead ternarize the *base* once (shared, O(O·I)) and the *factors* (ternary low-rank),
+    the forward is `ternary_base @ x + sigma·rank_scale·(x @ Bt) @ Atᵀ` -- LINEAR in the
+    perturbation, so EGGROLL's never-materialize trick is recovered (one shared base GEMM +
+    a cheap low-rank correction, O((O+I)·r) per member instead of O(O·I)). Both terms are
+    ternary×activation => add-only (BitNet), so it is also multiply-free (up to the per-matrix
+    absmean scalar and the sigma scale).
+
+    Trade-off vs `eggroll_linear_ternary`: the ES perturbation is now ternary, not Gaussian,
+    and exploration happens via the additive low-rank term rather than by flipping the base's
+    quantization (re-validate -- DESIGN §6.2/§6.6). `weight` is the float latent master,
+    quantized to the ternary base each forward (QAT-style); ES updates the master via
+    `Σ f_p ternarize(A_p) ternarize(B_p)ᵀ` (see `es_update(..., ternarize_keys=...)`).
+
+    x: (P,B,S,I) or (B,S,I); weight (O,I); A (P,O,r); B (P,I,r)."""
+    Wt = ternary_quantize(weight)                    # shared ternary base, quantized ONCE
+    At = ternarize_factor(A)                          # (P,O,r) ternary
+    Bt = ternarize_factor(B)                          # (P,I,r) ternary
+    base = F.linear(x, Wt)                            # ONE shared GEMM (ternary x activation)
+    if x.dim() == 3:                                  # (B,S,I): broadcast a new pop dim
+        lr = torch.einsum("bsi,pir->bspr", x, Bt)
+        lr = torch.einsum("bspr,por->pbso", lr, At)
+        out = base.unsqueeze(0) + (sigma * rank_scale) * lr
+    else:                                             # (P,B,S,I): pop dim already there
+        lr = torch.einsum("pbsi,pir->pbsr", x, Bt)
+        lr = torch.einsum("pbsr,por->pbso", lr, At)
+        out = base + (sigma * rank_scale) * lr
+    if bias is not None:
+        out = out + bias
+    if bias_noise is not None:
+        out = out + sigma * bias_noise[:, None, None, :]
+    return out                                        # (P,B,S,O)
+
+
 def eggroll_linear_ternary(x, weight, A, B, bias=None, bias_noise=None,
                            sigma=config.SIGMA, rank_scale=config.RANK_SCALE, quantize=True):
     """Ternary EGGROLL linear (Stage 1b). Ternary breaks the no-materialize trick
@@ -156,12 +205,16 @@ def newton_schulz(G, steps=5, eps=1e-7):
 
 @torch.no_grad()
 def es_update(params, noise, fit, coeff, rank_scale=config.RANK_SCALE,
-              muon=False, muon_lr=0.02, ns_steps=5, eps=1e-7):
+              muon=False, muon_lr=0.02, ns_steps=5, eps=1e-7, ternarize_keys=None):
     """In-place ES step.
 
     Default (muon=False): par += coeff * upd, where for `_w` matrices
     upd = (1/sqrt r) sum_p f_p A_p B_p^T (no perturbed weight materialized), and for
     dense params upd = sum_p f_p * noise_p (tensordot over the pop axis).
+
+    `ternarize_keys`: set of `_w` names trained with `eggroll_linear_ternary_lowrank`. For
+    these the perturbation that was *applied* used `ternarize_factor(A/B)`, so the update
+    must accumulate the SAME ternarized factors (else forward != update -> biased estimator).
 
     muon=True: orthogonalize the matrix update (Newton-Schulz) and RMS-normalize the
     vector update, then step by `muon_lr`. This DECOUPLES the step magnitude from the
@@ -171,6 +224,8 @@ def es_update(params, noise, fit, coeff, rank_scale=config.RANK_SCALE,
     for name, par in params.items():
         if name.endswith("_w"):
             A, B = noise[name]
+            if ternarize_keys is not None and name in ternarize_keys:
+                A, B = ternarize_factor(A), ternarize_factor(B)
             upd = rank_scale * torch.einsum("p,por,pir->oi", fit, A, B)
         else:
             upd = torch.tensordot(fit, noise[name], dims=([0], [0]))

@@ -36,20 +36,70 @@ from . import config
 from .eggroll import (
     eggroll_linear,
     eggroll_linear_ternary,
+    eggroll_linear_ternary_lowrank,
     eggroll_ln,
     sample_noise,
     zero_noise,
 )
+from .int_membrane import int_recurrence_reference, ternary_W_materialize
+
+_KERNEL_FN = None
+
+
+def _kernel_recurrence():
+    """Lazily import the Triton recurrence kernel from the repo-level kernels/ dir.
+
+    Kept lazy + path-injected so the package imports fine without Triton/GPU (CPU tests,
+    the float paths); only `use_kernel=True` (Stage 2.1) pulls it in."""
+    global _KERNEL_FN
+    if _KERNEL_FN is None:
+        import os
+        import sys
+        kdir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "kernels")
+        if kdir not in sys.path:
+            sys.path.insert(0, kdir)
+        from triton_recurrence import triton_int_recurrence
+        _KERNEL_FN = triton_int_recurrence
+    return _KERNEL_FN
 
 
 class SpikingM2RNN(nn.Module):
     def __init__(self, vocab, dim=config.DIM, depth=config.DEPTH, k=config.K_DIM,
                  v=config.V_DIM, mlp=config.MLP_DIM, mode=config.MODE,
                  threshold=config.THRESHOLD, decay=config.DECAY, input_decay=False,
-                 mac_free=False, ternary_W=False, ternary_all=False):
+                 mac_free=False, ternary_W=False, ternary_all=False,
+                 int_membrane=False, theta=None, decay_bias_init=None, use_kernel=False,
+                 outer_gain=None, ternary_lowrank=False):
         super().__init__()
         self.dim, self.depth, self.k, self.v, self.mode, self.vocab = dim, depth, k, v, mode, vocab
         self.threshold, self.decay = threshold, decay
+        # int_membrane (Stage 2.0, spike only): the INTEGER recurrence that is the Triton
+        # kernel's bit-exact contract (kernels/DESIGN.md §2). The fp mac_free leak
+        # `mem*2^{-s}` produces fractional membranes; the kernel uses an arithmetic right
+        # shift `mem>>s` (floor) -> they differ, so the kernel can't be bit-exact to the fp
+        # model. This path runs the true integer dynamics (int32 membrane, arithmetic shift,
+        # integer trans from ternary×binary, integer threshold θ, subtractive reset). It is
+        # the full multiply-free model, so it implies mac_free + ternary_all; only the
+        # recurrence changes (the parallel projections stay in the ternary float path, §1).
+        self.int_membrane = int_membrane and mode == "spike"
+        if self.int_membrane:
+            mac_free, ternary_all = True, True
+        # θ: integer firing threshold for the integer membrane (sweep + re-validate S3,
+        # DESIGN §2.1). For int_membrane the fp threshold 1.0 maps to ≈1/scale≈10 integer
+        # units (see outer_gain below); default 10. Else round(threshold).
+        if theta is None:
+            theta = 10 if self.int_membrane else round(threshold)
+        self.theta = int(round(theta))
+        # outer_gain: integer weight on the k⊗v write so it stays commensurate with `trans`
+        # in the integer domain (DESIGN §7 scale-fold fix). Defaults to θ (the fp model has
+        # outer == threshold == 1, both → ≈1/scale in integer units).
+        self.outer_gain = int(self.theta if outer_gain is None else outer_gain)
+        # use_kernel: run the int_membrane recurrence through the Triton kernel (Stage 2.1)
+        # instead of the torch reference. Bit-exact by construction (kernels/test_kernel.py);
+        # the fast path for training/inference. Falls back to the reference if int_membrane
+        # is off. Toggleable at runtime (the equivalence test flips it).
+        self.use_kernel = use_kernel
         # input_decay (spike only): replace the constant membrane leak with a learnable,
         # input-dependent, state-INDEPENDENT decay gate -- the float prototype of DESIGN
         # 6.4's shift-decay, and the spike analog of tanh's forget gate f_t. Opt-in so the
@@ -71,6 +121,14 @@ class SpikingM2RNN(nn.Module):
         # member's perturbed weight is materialized + quantized per forward.)
         self.ternary_W = ternary_W or ternary_all
         self.ternary_all = ternary_all
+        # ternary_lowrank: train the ternary projections with the LINEAR no-materialize path
+        # (`eggroll_linear_ternary_lowrank`: ternary base + ternary low-rank, no per-member
+        # quantize) instead of materializing+quantizing each member's weight. Recovers
+        # EGGROLL's never-materialize trick (memory O((O+I)·r)/member, not O(O·I)) and stays
+        # multiply-free. EXCLUDES the transition `_W`: its membrane is integer, so a float
+        # low-rank correction would break the int kernel -- it stays on the materialized path.
+        # ES perturbation becomes ternary (not Gaussian) -> re-validate (DESIGN §6.6).
+        self.ternary_lowrank = ternary_lowrank
 
         Pd = nn.ParameterDict()
         def mat(name, o, i):
@@ -104,6 +162,20 @@ class SpikingM2RNN(nn.Module):
             if par.dim() == 2:
                 nn.init.kaiming_uniform_(par, a=math.sqrt(5))
 
+        # Decay-gate bias init. For the integer membrane, the fp model's fractional
+        # accumulation that crossed θ is lost to the floor, so with the default gate
+        # (s_t≈1-2 at init) the membrane leaks away before reaching θ≥1 and the net is
+        # dead at init (no ES signal -- the §6.2 dead zone). A negative `_d` bias makes
+        # s_t≈0 (hold) at init, which both revives firing (~20% at θ=2) AND is the right
+        # inductive bias for state tracking (hold state, don't leak). Default -3.0 for
+        # int_membrane, 0 otherwise (other paths unchanged -- guardrail #2).
+        dbi = decay_bias_init if decay_bias_init is not None else (-3.0 if self.int_membrane else 0.0)
+        if dbi != 0.0:
+            with torch.no_grad():
+                for name, par in Pd.items():
+                    if name.endswith("_d_b"):
+                        par.fill_(dbi)
+
     # ---- per-step noise (delegates to the shared EGGROLL machinery) ----
     @torch.no_grad()
     def sample_noise(self, pop, rank, device, dtype):
@@ -117,9 +189,25 @@ class SpikingM2RNN(nn.Module):
         """Which weight matmuls are ternarized in the forward (float master unchanged)."""
         return self.ternary_all or (self.ternary_W and name.endswith("_W"))
 
+    def _is_ternary_lr(self, name):
+        """Ternary projections trained via the linear no-materialize path. Excludes the
+        transition `_W` (its integer membrane needs a single materialized ternary Wq)."""
+        return self.ternary_lowrank and self._is_ternary(name) and not name.endswith("_W")
+
+    def ternary_lr_keys(self):
+        """`_w` keys whose factors `es_update` must ternarize (forward==update). Pass to
+        `es_update(..., ternarize_keys=model.ternary_lr_keys())`."""
+        return {n for n in self.P.keys()
+                if n.endswith("_w") and self._is_ternary_lr(n[:-2])}
+
     def _lin(self, x, name, noise, sigma):
         A, B = noise[name + "_w"]
-        lin = eggroll_linear_ternary if self._is_ternary(name) else eggroll_linear
+        if self._is_ternary_lr(name):
+            lin = eggroll_linear_ternary_lowrank
+        elif self._is_ternary(name):
+            lin = eggroll_linear_ternary
+        else:
+            lin = eggroll_linear
         return lin(x, self.P[name + "_w"], A, B,
                    bias=self.P[name + "_b"], bias_noise=noise[name + "_b"], sigma=sigma)
 
@@ -148,17 +236,42 @@ class SpikingM2RNN(nn.Module):
                 Kp = (Kp > 0).to(x.dtype)
                 Vp = (Vp > 0).to(x.dtype)
                 f_t = None
+                s_int = None
                 if self.input_decay:                          # learnable input-dependent leak
                     raw = self._lin(xn, p + "_d", noise, sigma)                  # (P,B,T,1)
                     if self.mac_free:
                         # quantize to a shift amount s_t in {0,1,2,3} -> decay = 2^{-s_t}
                         # (s_t=0 hold, s_t=3 fast forget); the leak is a bit-shift in-kernel.
                         s_t = torch.round(torch.sigmoid(raw) * 3.0).clamp_(0.0, 3.0)
+                        if self.int_membrane:
+                            s_int = s_t.squeeze(-1).to(torch.int32)              # (P,B,T) shift amount
                         d_t = torch.pow(2.0, -s_t)
                     else:
                         d_t = torch.sigmoid(raw)                                 # continuous in (0,1)
             else:                                             # analog M2RNN
                 f_t = torch.sigmoid(self._lin(xn, p + "_f", noise, sigma))   # (P,B,T,1)
+
+            if self.int_membrane:
+                # Stage 2.0 integer recurrence (the Triton kernel's bit-exact contract).
+                # Materialize the per-member ternary transition Wq∈{-1,0,1} (the per-member
+                # scale is carried by θ and outer_gain≈1/scale, DESIGN §7); run the int32
+                # membrane dynamics; hand the integer readout y∈[0,K] back to the float `_o`
+                # projection (the parallel path stays float, §1).
+                Aw, Bw = noise[p + "_W_w"]
+                Wq = ternary_W_materialize(self.P[p + "_W_w"], Aw, Bw, sigma, config.RANK_SCALE)
+                recur = _kernel_recurrence() if self.use_kernel else int_recurrence_reference
+                ret = recur(Kp.to(torch.int32), Vp.to(torch.int32),
+                            Q.to(torch.int32), Wq, s_int, self.theta,
+                            return_fire=return_fire, outer_gain=self.outer_gain)
+                Yi = ret[0] if return_fire else ret
+                if return_fire:
+                    fire_acc += ret[1]; fire_n += 1
+                Y = Yi.to(x.dtype)                                                # (P,B,T,v)
+                x = x + self._lin(Y, p + "_o", noise, sigma)                      # residual
+                xn2 = self._ln(x, p + "_ln2", noise, sigma)
+                h   = F.gelu(self._lin(xn2, p + "_fc1", noise, sigma))
+                x   = x + self._lin(h, p + "_fc2", noise, sigma)
+                continue
 
             state = torch.zeros(Pn, Bn, k_, v_, device=x.device, dtype=x.dtype)   # H (analog) | S_prev (spiking)
             mem   = torch.zeros(Pn, Bn, k_, v_, device=x.device, dtype=x.dtype)   # U (spiking only)
