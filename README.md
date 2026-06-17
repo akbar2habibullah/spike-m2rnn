@@ -139,10 +139,12 @@ raise `--sigma` then `--pop`; **going deeper helped more than larger POP** (dept
 converged fastest). `--muon` (Newton-Schulz-orthogonalized update) is available to decouple
 step size from POP, but the small-POP depth-8 config already converges, so it's optional.
 
-## Stage 2 — Triton kernel — 🚧 TODO
-Bit-packed ternary × binary spikes via AND+popcount, **in-SRAM Philox noise**, fused
-recurrence. **Must be bit-exact vs Stage 1** (kernel invariants: DESIGN §7). (No
-launch command yet.)
+## Stage 2 — Triton kernel — 🚧 TODO (design ready)
+Bit-packed ternary × binary spikes via AND+popcount (or int8 IMMA), **in-SRAM Philox
+noise**, fused integer recurrence. **Must be bit-exact vs an integer-membrane reference**
+(not the fp model — see the doc). Full implementation spec, op-by-op dispatch table,
+bitplane/Philox formats, sub-staging, and validation plan:
+**[kernels/DESIGN.md](kernels/DESIGN.md)**. (No launch command yet.)
 
 ---
 
