@@ -70,7 +70,7 @@ class SpikingM2RNN(nn.Module):
                  threshold=config.THRESHOLD, decay=config.DECAY, input_decay=False,
                  mac_free=False, ternary_W=False, ternary_all=False,
                  int_membrane=False, theta=None, decay_bias_init=None, use_kernel=False,
-                 outer_gain=None, ternary_lowrank=False):
+                 outer_gain=None, ternary_lowrank=False, fp_bits=0, round_shift=False):
         super().__init__()
         self.dim, self.depth, self.k, self.v, self.mode, self.vocab = dim, depth, k, v, mode, vocab
         self.threshold, self.decay = threshold, decay
@@ -100,6 +100,17 @@ class SpikingM2RNN(nn.Module):
         # the fast path for training/inference. Falls back to the reference if int_membrane
         # is off. Toggleable at runtime (the equivalence test flips it).
         self.use_kernel = use_kernel
+        # fp→int resolution knobs for the integer membrane (kernels/DESIGN.md §2): fixed-point
+        # fractional bits + round-to-nearest leak, the fixes for the fp model's lost precision.
+        # Default OFF (= pure-integer floor) so the current Triton kernel stays bit-exact; sweep
+        # them on the reference path to reach 100%, THEN align the kernel. The kernel does not
+        # implement them yet, so refuse the combination rather than run mismatched semantics.
+        self.fp_bits = int(fp_bits)
+        self.round_shift = bool(round_shift)
+        if self.use_kernel and (self.fp_bits or self.round_shift):
+            raise ValueError("use_kernel=True but fp_bits/round_shift are set; the Triton kernel "
+                             "doesn't implement them yet. Sweep on the reference (use_kernel=False), "
+                             "then update the kernel to match before enabling it.")
         # input_decay (spike only): replace the constant membrane leak with a learnable,
         # input-dependent, state-INDEPENDENT decay gate -- the float prototype of DESIGN
         # 6.4's shift-decay, and the spike analog of tanh's forget gate f_t. Opt-in so the
@@ -260,9 +271,12 @@ class SpikingM2RNN(nn.Module):
                 Aw, Bw = noise[p + "_W_w"]
                 Wq = ternary_W_materialize(self.P[p + "_W_w"], Aw, Bw, sigma, config.RANK_SCALE)
                 recur = _kernel_recurrence() if self.use_kernel else int_recurrence_reference
+                # fp_bits/round_shift only go to the torch reference; the kernel doesn't accept
+                # them yet (guarded in __init__). When the kernel implements them, pass here too.
+                extra = {} if self.use_kernel else dict(fp_bits=self.fp_bits, round_shift=self.round_shift)
                 ret = recur(Kp.to(torch.int32), Vp.to(torch.int32),
                             Q.to(torch.int32), Wq, s_int, self.theta,
-                            return_fire=return_fire, outer_gain=self.outer_gain)
+                            return_fire=return_fire, outer_gain=self.outer_gain, **extra)
                 Yi = ret[0] if return_fire else ret
                 if return_fire:
                     fire_acc += ret[1]; fire_n += 1

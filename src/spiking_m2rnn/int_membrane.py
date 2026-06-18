@@ -44,7 +44,7 @@ def ternary_W_materialize(weight, A, B, sigma, rank_scale, eps=1e-5):
 
 @torch.no_grad()
 def int_recurrence_reference(kt, vt, qt, Wq, s, theta, state0=None, return_fire=False,
-                             outer_gain=1):
+                             outer_gain=1, fp_bits=0, round_shift=False):
     """Bit-exact integer recurrence over time (the kernel contract).
 
     Shapes (P=pop, B=batch, T=time, K=key dim, V=value dim):
@@ -55,6 +55,8 @@ def int_recurrence_reference(kt, vt, qt, Wq, s, theta, state0=None, return_fire=
       s  : (P,B,T)   int {0,1,2,3}     per-step shift-decay amount
       theta : int                      integer firing threshold
       outer_gain : int                 integer weight on the k⊗v write (DESIGN §7 fix)
+      fp_bits : int                    fixed-point fractional bits on the membrane (see below)
+      round_shift : bool               round-to-nearest leak instead of floor (see below)
       state0 : (P,B,K,V) int32 binary or None (zeros)
     Returns Y (P,B,T,V) int32 in [0,K]; if return_fire also the scalar firing rate.
 
@@ -63,6 +65,17 @@ def int_recurrence_reference(kt, vt, qt, Wq, s, theta, state0=None, return_fire=
     (scale≈0.1), so in integer units the k⊗v write and θ both carry ≈1/scale≈10. Folding
     only θ leaves `outer` ~10× too weak to write key→value bindings -> the net can't track
     state. `outer_gain≈round(1/scale)` (and θ to match) restores the fp balance.
+
+    fp→int RESOLUTION (the two knobs that recover the last few % vs the fp model):
+      * `fp_bits=F`  -- run the membrane in fixed-point units of 2^{-F}: scale the per-step
+        contributions and θ by 2^F so the leak `>>s` keeps F fractional bits of the decayed
+        value instead of flooring to integers. F=0 is the pure-integer floor model; F→∞
+        recovers the fp `mac_free` dynamics. Still pure integer/shift (kernel-friendly),
+        just with headroom. Typically F=3-4 closes the gap.
+      * `round_shift` -- round-to-nearest arithmetic shift `(mem + 2^{s-1}) >> s` instead of
+        truncation; cheaply removes the downward bias of the floor.
+    Both default OFF so the existing kernel (floor, no fp_bits) stays bit-exact at defaults;
+    once a config reaches 100% on the reference, the Triton kernel must be updated to match.
 
     The trans/y reductions go through fp32 (exact for these integer ranges) so the
     function runs on CUDA; everything else is int32.
@@ -76,7 +89,8 @@ def int_recurrence_reference(kt, vt, qt, Wq, s, theta, state0=None, return_fire=
     else:
         state = state0.to(torch.int32)
     mem = torch.zeros(P, B, K, V, dtype=torch.int32, device=dev)
-    theta_i = int(theta)
+    scale = 1 << int(fp_bits)                            # fixed-point unit (2^F)
+    theta_i = int(theta) * scale                         # θ in fixed-point units
     og = int(outer_gain)
     ys = []
     fire_acc, fire_n = 0.0, 0
@@ -90,10 +104,17 @@ def int_recurrence_reference(kt, vt, qt, Wq, s, theta, state0=None, return_fire=
         trans = torch.einsum("pbki,poi->pbko", state.to(torch.float32), Wqf)
         trans = trans.round().to(torch.int32)
         s_t = s[:, :, t].to(torch.int32)[:, :, None, None]   # (P,B,1,1)
-        mem = torch.bitwise_right_shift(mem, s_t) + trans + outer
+        if round_shift:                                  # round-to-nearest leak: + 2^{s-1}
+            radd = torch.where(s_t > 0,
+                               torch.bitwise_left_shift(torch.ones_like(s_t), (s_t - 1).clamp(min=0)),
+                               torch.zeros_like(s_t))
+            leaked = torch.bitwise_right_shift(mem + radd, s_t)
+        else:
+            leaked = torch.bitwise_right_shift(mem, s_t)
+        mem = leaked + (trans + outer) * scale           # contributions in fixed-point units
         S = (mem > theta_i).to(torch.int32)              # (P,B,K,V) {0,1}
         mem = mem - theta_i * S
-        # y_t[v] = Σ_k S[k,v]·q_t[k]  ∈ [0, K]
+        # y_t[v] = Σ_k S[k,v]·q_t[k]  ∈ [0, K]   (binary, unaffected by fp_bits)
         y = torch.einsum("pbkv,pbk->pbv", S.to(torch.float32), qt_t).round().to(torch.int32)
         ys.append(y)
         state = S

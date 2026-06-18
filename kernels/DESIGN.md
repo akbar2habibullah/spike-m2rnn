@@ -59,6 +59,22 @@ Then:
 Keep the fp `mac_free` model as the algorithmic prototype; the integer model is the kernel's
 contract.
 
+**2a. Resolution knobs (the fp→int gap, and what closes it).** The pure-integer floor model
+(`mem >> s`) loses the fractional membrane precision the fp FSA relied on, and converges but
+**stalls short of 100%**. Two reference-side knobs recover it (both in
+`int_recurrence_reference`, opt-in via `--fp-bits` / `--round-shift`, default off so the
+current kernel stays bit-exact):
+- **`fp_bits=F`** — run the membrane in fixed-point units of `2^{-F}`: contributions and `θ`
+  scale by `2^F`, so the leak `>>s` keeps F fractional bits instead of flooring. `F=0` is the
+  floor model, `F→∞` recovers fp. Typically `F=3–4` closes the gap. Still pure integer/shift.
+- **`round_shift`** — round-to-nearest leak `(mem + 2^{s-1}) >> s` instead of truncation.
+
+**Workflow:** sweep `--fp-bits`/`--round-shift` on the *reference* (`use_kernel=False`) until
+S3 hits 100%; lock that `(F, round_shift, θ, outer_gain)` config; **then update the Triton
+kernel to implement the same fixed-point scaling + rounding** and re-confirm bit-exactness.
+The model raises if `use_kernel=True` with `F>0`/`round_shift` set (the kernel doesn't
+implement them yet) — don't run mismatched semantics.
+
 ## 3. Op-by-op dispatch table (recurrence step)
 
 | Op (per timestep, per (p,b)) | Math | Kernel realization | Notes |

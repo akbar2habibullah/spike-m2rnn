@@ -122,14 +122,15 @@ def _fmt_profile(acc_per_pos, train_max):
 def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
           generators="all", input_decay=False, mac_free=False, ternary_W=False,
           ternary_all=False, int_membrane=False, theta=None, use_kernel=False,
-          outer_gain=None, ternary_lowrank=False):
+          outer_gain=None, ternary_lowrank=False, fp_bits=0, round_shift=False):
     vocab = group.size
     model = SpikingM2RNN(vocab, dim=cfg.dim, depth=cfg.depth, k=cfg.k_dim, v=cfg.v_dim,
                          mlp=cfg.mlp_dim, mode=cfg.mode, threshold=cfg.threshold,
                          decay=cfg.decay, input_decay=input_decay, mac_free=mac_free,
                          ternary_W=ternary_W, ternary_all=ternary_all,
                          int_membrane=int_membrane, theta=theta, outer_gain=outer_gain,
-                         use_kernel=use_kernel, ternary_lowrank=ternary_lowrank).to(cfg.device).to(cfg.dtype)
+                         use_kernel=use_kernel, ternary_lowrank=ternary_lowrank,
+                         fp_bits=fp_bits, round_shift=round_shift).to(cfg.device).to(cfg.dtype)
     tern_lr_keys = model.ternary_lr_keys()
     model.eval(); model.requires_grad_(False)
     if compile:
@@ -152,7 +153,8 @@ def train(group, train_lens, eval_lens, steps, eval_every, cfg, compile=False,
                   else "input-dependent" if input_decay else cfg.decay)
     ternary_desc = "all" if model.ternary_all else ("W" if model.ternary_W else "off")
     upd_desc = f"muon(lr={cfg.muon_lr})" if cfg.muon else f"es(lr={cfg.lr})"
-    membrane_desc = (f"int(theta={model.theta},outer_gain={model.outer_gain})"
+    membrane_desc = (f"int(theta={model.theta},outer_gain={model.outer_gain},"
+                     f"fp_bits={model.fp_bits},round_shift={model.round_shift})"
                      if model.int_membrane else "float")
     if model.ternary_lowrank:
         ternary_desc += f"+lowrank({len(tern_lr_keys)} mats, no-materialize)"
@@ -246,6 +248,14 @@ def _cli():
                     help="integer weight on the k⊗v write for --int-membrane (default = θ). "
                          "The naive scale-fold (outer∈{0,1}) leaves the write ~10x too weak vs "
                          "trans; outer_gain≈round(1/scale)≈10 restores the fp balance (DESIGN §7).")
+    ap.add_argument("--fp-bits", type=int, default=0,
+                    help="fixed-point fractional bits on the int membrane (default 0 = floor). "
+                         "The leak `>>s` keeps F bits of the decayed value instead of flooring; "
+                         "F=3-4 recovers the fp precision lost in the int conversion. Reference "
+                         "path only — align the kernel before --use-kernel with F>0.")
+    ap.add_argument("--round-shift", action="store_true",
+                    help="round-to-nearest leak `(mem+2^{s-1})>>s` instead of floor (int membrane). "
+                         "Removes the floor's downward bias; reference path only (see --fp-bits).")
     ap.add_argument("--use-kernel", action="store_true",
                     help="run the int_membrane recurrence through the Triton kernel (Stage 2.1, "
                          "bit-exact vs the torch reference; ~84x faster recurrence). Requires "
@@ -284,7 +294,8 @@ def _cli():
           ternary_W=args.ternary_w, ternary_all=args.ternary_all,
           int_membrane=args.int_membrane, theta=args.theta,
           outer_gain=args.outer_gain, use_kernel=args.use_kernel,
-          ternary_lowrank=args.ternary_lowrank)
+          ternary_lowrank=args.ternary_lowrank, fp_bits=args.fp_bits,
+          round_shift=args.round_shift)
 
 
 if __name__ == "__main__":
